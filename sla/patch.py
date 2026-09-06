@@ -22,7 +22,7 @@ import logging
 import torch
 
 from .block_map import get_block_map, get_protected_block_ranges
-from .kernel import block_sparse_attention
+from .kernel import block_sparse_attention, warm_launch_config
 
 log = logging.getLogger("H3Utils")
 
@@ -45,10 +45,11 @@ _BACKEND_CANDIDATES = {
     ),
 }
 
-# Every mode kijai/ComfyUI-KJNodes' PatchSageAttentionKJ node offers, kept in
-# the same order and named to match its dropdown so the two are recognizable
-# side by side. Each maps to the exact sageattention kernel + pv_accum_dtype
-# KJNodes' _patch_modules uses for that mode -- pv_accum_dtype is not cosmetic,
+# Every mode a widely-used third-party SageAttention patch node offers, kept
+# in the same order and named to match its dropdown so the two are
+# recognizable side by side. Each maps to the exact sageattention kernel +
+# pv_accum_dtype that node's own mode-to-kernel mapping uses -- pv_accum_dtype
+# is not cosmetic,
 # it is the single biggest speed/quality knob within sage (fp32 safest, fp16
 # fastest and most prone to overflow-driven artifacts), so silently picking
 # one for the user would defeat the point of exposing the modes at all.
@@ -66,12 +67,13 @@ _backend_cache = {}
 def _build_sage_dense_fn(mode):
     """Build a dense-path callable for one ``sage:<kernel>`` mode.
 
-    Calls the ``sageattention`` package directly -- the same package KJNodes'
-    PatchSageAttentionKJ wraps -- rather than depending on KJNodes being
-    installed, since its node isn't a stable importable API. The reshape /
-    tensor_layout / mask handling below mirrors KJNodes' own ``attention_sage``
-    exactly, since that is what makes swapping this in a drop-in replacement
-    for what that node does globally, just scoped to this model's dense steps.
+    Calls the ``sageattention`` package directly -- the same package that
+    third-party patch node wraps -- rather than depending on that node pack
+    being installed, since its node isn't a stable importable API. The
+    reshape / tensor_layout / mask handling below mirrors that node's own
+    attention wrapper exactly, since that is what makes swapping this in a
+    drop-in replacement for what that node does globally, just scoped to
+    this model's dense steps.
     Returns None (with a logged reason) if ``sageattention`` isn't installed
     or the specific kernel this mode needs isn't in it.
     """
@@ -278,9 +280,84 @@ def _summarise(state, sparsity, blkq, blkk):
                     state["failed"])
 
 
+_CK_WARNED: set = set()
+
+
+def _ck_warn_once(key, message):
+    if key not in _CK_WARNED:
+        _CK_WARNED.add(key)
+        log.warning("[H3Utils] comfy_kitchen engine: %s", message)
+
+
+def _ck_sol_attn(qb, kb, vb, topk_ratio, prefix, protected_ranges,
+                 reference_sparsity, stabilize_motion, qk_scale,
+                 tail_correction=True):
+    """Route through comfy_kitchen's real compiled sol_attn kernel (see
+    Comfy-Org/ComfyUI PR #16072, comfy_kitchen>=0.2.32) instead of this
+    package's own Triton path -- real CUDA int8 compute and a built-in
+    pooled tail term (gated by ``tail_correction`` the same as the Triton
+    path, rather than always on), at the cost of three features this
+    engine's API cannot express, each silently disabled with a one-time
+    warning rather than an error (same "never cost the user their run"
+    policy as the rest of this file):
+
+    - Only ONE contiguous sink range (``sink_blocks``), not the disjoint
+      prefix + reference-excluding spans ``protected_ranges`` supports here.
+      A multi-span request degrades to no protection at all -- approximating
+      it with a union bounding range risks silently making a huge
+      reference/video span "always exact", which is worse than an honest gap.
+    - No reference-quota tier: sol_attn has only the one sink range above,
+      nothing analogous to this file's separate ``reference_sparsity``.
+    - No ``stabilize_motion``: sol_attn's routing is stateless per call, with
+      no equivalent to this file's cross-step LUT stickiness.
+    """
+    import comfy_kitchen as ck   # ImportError -> caller's except -> dense()
+
+    if protected_ranges is not None:
+        _ck_warn_once(
+            "multi_range",
+            "protect_ranges has multiple spans; the comfy_kitchen engine "
+            "only supports one contiguous sink range, so prefix/audio "
+            "protection is OFF for this run. Use the custom (Triton) "
+            "engine if you need it.")
+        sink_blocks = [0, 0]
+    elif prefix > 0:
+        block = 64  # comfy_kitchen's sol_attn hardcodes a 64-token block
+        sink_blocks = [0, (prefix + block - 1) // block]
+    else:
+        sink_blocks = [0, 0]
+
+    if reference_sparsity is not None:
+        _ck_warn_once(
+            "reference_quota",
+            "reference_protection has no equivalent in the comfy_kitchen "
+            "engine and is ignored here. Use the custom (Triton) engine "
+            "for that feature.")
+    if stabilize_motion:
+        _ck_warn_once(
+            "stabilize_motion",
+            "stabilize_motion has no equivalent in the comfy_kitchen engine "
+            "(routing is stateless per call) and is ignored here.")
+
+    # The CUDA backend rejects anything that isn't literally bfloat16 --
+    # NOT fp16, despite fp16 being "close enough" everywhere else in this
+    # file. Getting this wrong means every call throws immediately and
+    # silently falls back to dense (see the warning this now produces).
+    cast = qb.dtype != torch.bfloat16
+    qc, kc, vc = (
+        (t.to(torch.bfloat16) if cast else t) for t in (qb, kb, vb)
+    )
+    out = ck.sol_attn(
+        qc, kc, vc, scale=qk_scale, sink_blocks=sink_blocks, sink_q=[0, 0],
+        topk_ratio=topk_ratio, tail=bool(tail_correction),
+    )
+    return out.to(qb.dtype) if cast else out
+
+
 def _make_override(state, sparsity_ratio, blkq, blkk, min_seq_len,
                    protect_audio=True, dense_fn=None, stabilize_motion=False,
-                   reference_sparsity=None):
+                   reference_sparsity=None, tail_correction=False,
+                   use_int8_qk=False, use_int8_pv=False, engine="triton"):
     """``dense_fn``, when not None, is a specific backend (e.g. always
     ``attention_pytorch``) that every dense fall-through uses instead of
     ``func``. Without it, ``func`` is whatever ``optimized_attention``
@@ -298,6 +375,11 @@ def _make_override(state, sparsity_ratio, blkq, blkk, min_seq_len,
     current step, reset to 0 by the wrapper at the top of every step, and it
     works because the model graph is static: the Nth attention call happens
     in the same layer every step.
+
+    ``engine="comfy_kitchen"`` swaps this file's own Triton kernel for
+    comfy_kitchen's real compiled sol_attn kernel -- see ``_ck_sol_attn``'s
+    docstring for exactly what that engine cannot express relative to
+    ``engine="triton"`` (the default, and everything documented above).
     """
     topk_ratio = 1.0 - sparsity_ratio
 
@@ -363,38 +445,69 @@ def _make_override(state, sparsity_ratio, blkq, blkk, min_seq_len,
             state["call_idx"] = call_idx + 1
             prev_lut = state["prev_lut"].get(call_idx) if stabilize_motion else None
 
-            if stabilize_motion:
-                lut, topk, history = get_block_map(
-                    qb, kb, topk_ratio, blkq, blkk,
-                    protect_upto=prefix, prev_lut=prev_lut,
-                    protect_ranges=protected_ranges, return_history=True,
-                    stabilize_query_from=stabilize_query_from,
-                    reference_ranges=reference_ranges,
-                    reference_sparsity=reference_sparsity,
-                )
-                # Only the bounded boundary slice is retained -- see
-                # block_map.py. Storing the full lut here is what made this
-                # grow to several GB per run at 768p with stabilize_motion on.
-                state["prev_lut"][call_idx] = history
+            qk_scale = D ** -0.5
+
+            use_ck = engine == "comfy_kitchen"
+
+            if use_ck:
+                out = _ck_sol_attn(qb, kb, vb, topk_ratio, prefix,
+                                   protected_ranges, reference_sparsity,
+                                   stabilize_motion, qk_scale,
+                                   tail_correction=tail_correction)
+                # comfy_kitchen's sol_attn hardcodes a 64-token block; these
+                # are for the same run-summary stats the Triton path below
+                # reports, not a real selection this file made.
+                blocks = (S + 64 - 1) // 64
+                topk = max(0, min(blocks - 1, max(1, round(topk_ratio * blocks))))
             else:
-                lut, topk = get_block_map(
-                    qb, kb, topk_ratio, blkq, blkk,
-                    protect_upto=prefix, prev_lut=prev_lut,
-                    protect_ranges=protected_ranges,
-                    reference_ranges=reference_ranges,
-                    reference_sparsity=reference_sparsity,
-                )
-            out = block_sparse_attention(qb, kb, vb, lut, topk, blkq, blkk)
+                if stabilize_motion:
+                    lut, topk, history, *rest = get_block_map(
+                        qb, kb, topk_ratio, blkq, blkk,
+                        protect_upto=prefix, prev_lut=prev_lut,
+                        protect_ranges=protected_ranges, return_history=True,
+                        stabilize_query_from=stabilize_query_from,
+                        reference_ranges=reference_ranges,
+                        reference_sparsity=reference_sparsity,
+                        v=vb, qk_scale=qk_scale, tail_correction=tail_correction,
+                    )
+                    # Only the bounded boundary slice is retained -- see
+                    # block_map.py. Storing the full lut here is what made this
+                    # grow to several GB per run at 768p with stabilize_motion on.
+                    state["prev_lut"][call_idx] = history
+                    tail = rest[0] if tail_correction else None
+                else:
+                    lut, topk, *rest = get_block_map(
+                        qb, kb, topk_ratio, blkq, blkk,
+                        protect_upto=prefix, prev_lut=prev_lut,
+                        protect_ranges=protected_ranges,
+                        reference_ranges=reference_ranges,
+                        reference_sparsity=reference_sparsity,
+                        v=vb, qk_scale=qk_scale, tail_correction=tail_correction,
+                    )
+                    tail = rest[0] if tail_correction else None
+                out = block_sparse_attention(qb, kb, vb, lut, topk, blkq, blkk,
+                                             qk_scale=qk_scale, tail=tail,
+                                             use_int8_qk=use_int8_qk,
+                                             use_int8_pv=use_int8_pv)
+                blocks = (S + blkk - 1) // blkk
 
             state["calls"] += 1
             state["seq"] = S
             state["kept"] = topk
-            state["blocks"] = (S + blkk - 1) // blkk
-            state["pinned"] = sum(
-                last - first for first, last in get_protected_block_ranges(
-                    prefix, protected_ranges, blkk, state["blocks"]
+            state["blocks"] = blocks
+            if use_ck:
+                # get_protected_block_ranges assumes a single-range or
+                # protect_ranges input; the comfy_kitchen path already
+                # collapsed to at most one range (or none) inside
+                # _ck_sol_attn, so recompute pinned count from that same
+                # decision rather than re-deriving it.
+                state["pinned"] = 0 if protected_ranges is not None else prefix
+            else:
+                state["pinned"] = sum(
+                    last - first for first, last in get_protected_block_ranges(
+                        prefix, protected_ranges, blkk, state["blocks"]
+                    )
                 )
-            )
 
             # [1, S, H, D] -> what the caller expects
             if skip_output_reshape:
@@ -404,7 +517,20 @@ def _make_override(state, sparsity_ratio, blkq, blkk, min_seq_len,
         except Exception as exc:  # noqa: BLE001 - a bad kernel must not kill the run
             if state["failed"] is None:
                 state["failed"] = "%s: %s" % (exc.__class__.__name__, exc)
-                log.debug("[H3Utils] SLA kernel failed", exc_info=True)
+                if engine == "comfy_kitchen":
+                    # Visible on purpose, unlike the debug line below: this
+                    # engine is new and its failure mode is silent dense
+                    # fallback, which at typical sparsity is NOT far enough
+                    # from sparse speed to be obviously wrong from timing
+                    # alone -- exactly the "no speedup, unclear why" case
+                    # this is here to rule out.
+                    log.warning(
+                        "[H3Utils] comfy_kitchen engine failed, falling back "
+                        "to dense for the rest of this run: %s",
+                        state["failed"], exc_info=True,
+                    )
+                else:
+                    log.debug("[H3Utils] SLA kernel failed", exc_info=True)
             return dense()
 
     return override
@@ -492,7 +618,7 @@ def _resolve_reference_sparsity(reference_protection):
     else:
         mode = str(reference_protection).strip().lower()
     if mode in ("heavy enforcement", "true"):
-        return "true", 0.0
+        return "heavy enforcement", 0.0
     if mode in ("light", "manual"):
         return "light", REFERENCE_LIGHT_SPARSITY
     return "off", None
@@ -747,7 +873,8 @@ def _make_wrapper(state, sparsity_ratio, blkq, blkk, dense_last_steps,
 def patch_h3_sla(model, sparsity_ratio=0.90, block_size=64, min_seq_len=8192,
                  dense_last_steps=0, protect_audio=True, dense_backend="comfy_kitchen",
                  dense_steps="", disable_fp16_accum=True, stabilize_motion=False,
-                 reference_protection="Off"):
+                 reference_protection="Off", tail_correction=False,
+                 use_int8_qk=False, use_int8_pv=False, engine="triton"):
     """Return a clone of ``model`` whose H3 self-attention runs block-sparse.
 
     Weights are untouched; this only installs an attention override and a
@@ -785,13 +912,86 @@ def patch_h3_sla(model, sparsity_ratio=0.90, block_size=64, min_seq_len=8192,
     tuned protection, and most likely unusable with max ref size mode), and
     ``Light`` guarantees the best 15% of every reference range without
     displacing ordinary video choices.
+
+    ``tail_correction`` adds one pooled term per query block standing in for
+    every key block ``topk`` left out, instead of plain top-k's hard zero for
+    anything unselected -- see block_map.py's ``get_block_map`` docstring.
+    Off by default: it's new, it costs one extra mean-pool of V plus a small
+    reduction per call, and its quality effect on H3 specifically hasn't been
+    validated the way ``sparsity_ratio``'s defaults have.
+
+    ``use_int8_qk`` quantizes Q and K to int8 (per-token, dynamic scale)
+    before the QK dot product on the selected topk blocks only -- PV stays
+    native dtype, matching SageAttention's ``qk_int8_pv_fp16`` split rather
+    than full int8 attention. UNTESTED ON HARDWARE as of this addition: the
+    quantize/dequantize math was checked against exact fp32 QK scores in a
+    standalone numpy harness (~1% mean relative error on synthetic data,
+    numerically stable feeding the softmax), but the actual Triton kernel
+    path -- launch config, register pressure, real speed and quality on H3 --
+    has not been run on a GPU. Off by default for that reason alone, not
+    because the math is suspect. Ignored entirely when ``engine="comfy_kitchen"``,
+    which quantizes internally regardless of this flag.
+
+    ``use_int8_pv`` independently quantizes P and V to int8 for the second
+    matmul -- see ``block_sparse_attention``'s docstring for why V needs
+    per-channel quantization here rather than the per-token scheme
+    ``use_int8_qk`` uses, and why P itself can't be precomputed the way K/V
+    can. Same UNTESTED-ON-HARDWARE caveat as ``use_int8_qk``, checked the
+    same way (numpy harness against exact fp32 P@V, combined with
+    ``use_int8_qk`` end-to-end against dense ground truth). Also ignored
+    under ``engine="comfy_kitchen"``.
+
+    ``engine`` picks which attention implementation runs the sparse path:
+    ``"triton"`` (default) is this package's own kernel, everything else in
+    this docstring applies to it. ``"comfy_kitchen"`` instead calls
+    ``comfy_kitchen``'s real compiled sol_attn kernel (Comfy-Org/ComfyUI PR
+    #16072, comfy-kitchen>=0.2.32) -- genuine CUDA int8 compute and a
+    pooled tail gated by ``tail_correction`` same as the Triton path, but it
+    cannot express multi-span ``protect_ranges``, ``reference_protection``,
+    or ``stabilize_motion``; see ``_ck_sol_attn``'s docstring for exactly
+    what happens to each when set. Both fall back to dense the same as any
+    other kernel failure if their kernel is unavailable or throws. A saved
+    workflow with the removed ``"hybrid"`` value is treated as ``"triton"``.
     """
+    if engine == "hybrid":
+        log.warning(
+            "[H3Utils] SLA: engine=\"hybrid\" was removed; running this "
+            "saved workflow on the full-featured \"triton\" engine instead. "
+            "Re-save the node to update its stored value.")
+        engine = "triton"
+
     blkq = int(block_size)
     # BLKK=64 is not a typo. On sm_120 the 128x128 tile needs 160 KB of shared
     # memory against a ~99 KB limit and cannot launch at all; 128x64 both fits
     # and measured fastest. LightX2V picks the same split for its sage2 path on
     # non-sm90 architectures.
     blkk = 64 if blkq == 128 else blkq
+
+    # Warm the Triton launch-config cache for this exact settings combination
+    # now, at patch time, instead of letting the first real sampling call
+    # discover it. That first-ever call for a given (block size, tail_
+    # correction, use_int8_qk, use_int8_pv) combination tries every ladder
+    # rung in block_sparse_attention, catching OutOfResources on the failing
+    # ones -- a different, larger set of allocations than every later call,
+    # which only launches the one cached winner. Under ComfyUI's Comfy
+    # Compiler (Comfy-Org/ComfyUI PR #15861), that first call happens
+    # *inside* the CUDA-graph "malloc graph" capture region H3's forward
+    # wraps its block loop in, and a capture region that doesn't allocate the
+    # same way twice reports as a graph break. Doing the one-time probe here,
+    # before the model reaches the sampler, means the capture only ever sees
+    # the already-warmed, single-config path. Only relevant to engine=
+    # "triton", the only path that calls block_sparse_attention at all; a
+    # failed warm-up is never fatal, since the ladder still works on the
+    # first real call if this couldn't run.
+    if engine == "triton":
+        try:
+            import comfy.model_management as _mm
+            warm_launch_config(
+                _mm.get_torch_device(), torch.bfloat16, blkq, blkk,
+                has_tail=bool(tail_correction), use_int8_qk=bool(use_int8_qk),
+                use_int8_pv=bool(use_int8_pv))
+        except Exception:                              # noqa: BLE001
+            log.debug("[H3Utils] SLA: kernel warm-up skipped.", exc_info=True)
 
     dense_fn = _resolve_backend(dense_backend)
     dense_step_set = _parse_step_spec(dense_steps)
@@ -808,7 +1008,11 @@ def patch_h3_sla(model, sparsity_ratio=0.90, block_size=64, min_seq_len=8192,
         state, float(sparsity_ratio), blkq, blkk, int(min_seq_len),
         protect_audio=protect_audio, dense_fn=dense_fn,
         stabilize_motion=bool(stabilize_motion),
-        reference_sparsity=reference_sparsity)
+        reference_sparsity=reference_sparsity,
+        tail_correction=bool(tail_correction),
+        use_int8_qk=bool(use_int8_qk),
+        use_int8_pv=bool(use_int8_pv),
+        engine=engine)
     patched.model_options["transformer_options"] = to
 
     patched.add_wrapper_with_key(
@@ -820,14 +1024,16 @@ def patch_h3_sla(model, sparsity_ratio=0.90, block_size=64, min_seq_len=8192,
     )
 
     log.info(
-        "[H3Utils] SLA installed | sparsity=%.2f | BLK=%dx%d | min_seq_len=%d | "
-        "dense_last_steps=%d | dense_steps=%s | dense_backend=%s | "
-        "protect_audio=%s | reference_protection=%s%s | "
-        "disable_fp16_accum=%s | stabilize_motion=%s",
-        sparsity_ratio, blkq, blkk, min_seq_len, dense_last_steps,
+        "[H3Utils] SLA installed | engine=%s | sparsity=%.2f | BLK=%dx%d | "
+        "min_seq_len=%d | dense_last_steps=%d | dense_steps=%s | "
+        "dense_backend=%s | protect_audio=%s | reference_protection=%s%s | "
+        "disable_fp16_accum=%s | stabilize_motion=%s | tail_correction=%s | "
+        "use_int8_qk=%s | use_int8_pv=%s",
+        engine, sparsity_ratio, blkq, blkk, min_seq_len, dense_last_steps,
         sorted(dense_step_set) or "-", dense_backend, protect_audio,
         reference_mode,
         ("(%.2f)" % reference_sparsity) if reference_sparsity is not None else "",
-        disable_fp16_accum, stabilize_motion,
+        disable_fp16_accum, stabilize_motion, bool(tail_correction),
+        bool(use_int8_qk), bool(use_int8_pv),
     )
     return patched
